@@ -1,0 +1,67 @@
+name: keepalive
+
+# Plane (i) dead-man's-switch reset.
+#
+# GitHub auto-disables scheduled workflows in a repo with no commit activity for 60 days.
+# This workflow runs weekly to (1) keep the repo active so the 60-day clock never reaches
+# zero, and (2) re-enable any workflow GitHub has already auto-disabled for inactivity.
+#
+# Stagger rule: never `0 * * * *`. Runs Mondays 05:23 UTC.
+
+on:
+  schedule:
+    - cron: '23 5 * * 1'   # Mondays 05:23 UTC — staggered, off the hour
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # to commit the .keepalive touch
+  actions: write    # to re-enable auto-disabled workflows
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Touch .keepalive and commit [skip ci]
+        run: |
+          set -euo pipefail
+          STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          printf 'last-keepalive: %s\n' "$STAMP" >> .keepalive
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .keepalive
+          if git diff --cached --quiet; then
+            echo "no change to commit"
+          else
+            git commit -m "chore(keepalive): touch .keepalive ${STAMP} [skip ci]"
+            git push
+          fi
+
+      - name: Re-enable any auto-disabled workflows in this repo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "Scanning workflows in ${REPO} for auto-disabled state..."
+          # state values: active | disabled_manually | disabled_inactivity | disabled_fork
+          gh api --paginate "repos/${REPO}/actions/workflows" \
+            --jq '.workflows[] | [.id, .name, .state] | @tsv' \
+          | while IFS=$'\t' read -r id name state; do
+              echo "  workflow '${name}' (id=${id}) state=${state}"
+              if [ "${state}" = "disabled_inactivity" ]; then
+                echo "  -> re-enabling '${name}' (was auto-disabled for inactivity)"
+                gh api --method PUT "repos/${REPO}/actions/workflows/${id}/enable"
+              elif [ "${state}" = "disabled_manually" ]; then
+                echo "  -> leaving '${name}' disabled (manual/deliberate — respecting intent)"
+              fi
+            done
+          echo "Re-enable pass complete."

@@ -1,0 +1,183 @@
+name: org-hygiene-report
+
+# Plane (i) daily org hygiene report.
+#
+# Enumerates a-organvm repositories and reports per repo: open PR count, oldest open PR age,
+# default-branch last-push age, open issue count. Writes reports/YYYY-MM-DD-hygiene.md and
+# appends start/end bookend lines to bookends/YYYY-MM-DD.tsv, then commits both with [skip ci].
+#
+# Bookend contract: every run writes a `start` line at the top and an `end` line at the close,
+# in the shared TSV shape:  ts<TAB>job<TAB>-<TAB>-<TAB>start|end<TAB>status
+#
+# Private repos are not silently dropped: a 403/404 from a repo we can't read is counted as
+# `private-skipped` and reported, so there are no silent gaps.
+#
+# Stagger rule: never `0 * * * *`. Runs daily 13:36 UTC.
+
+on:
+  schedule:
+    - cron: '36 13 * * *'   # daily 13:36 UTC — staggered, off the hour
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # to commit the report + bookends
+
+concurrency:
+  group: org-hygiene-report
+  cancel-in-progress: false
+
+env:
+  ORG: a-organvm
+  JOB_NAME: org-hygiene-report
+
+jobs:
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bookend — start
+        run: |
+          set -euo pipefail
+          DAY="$(date -u +%Y-%m-%d)"
+          TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mkdir -p bookends
+          printf '%s\t%s\t-\t-\t%s\t%s\n' "$TS" "$JOB_NAME" "start" "running" \
+            >> "bookends/${DAY}.tsv"
+          echo "wrote start bookend to bookends/${DAY}.tsv"
+
+      - name: Generate hygiene report
+        id: report
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          DAY="$(date -u +%Y-%m-%d)"
+          NOW_EPOCH="$(date -u +%s)"
+          mkdir -p reports
+          REPORT="reports/${DAY}-hygiene.md"
+
+          age_days() {
+            # arg: ISO-8601 timestamp -> whole days since then (UTC)
+            local iso="$1"
+            [ -z "$iso" ] && { echo "-"; return; }
+            local then_epoch
+            then_epoch="$(date -u -d "$iso" +%s 2>/dev/null || echo "")"
+            [ -z "$then_epoch" ] && { echo "-"; return; }
+            echo $(( (NOW_EPOCH - then_epoch) / 86400 ))
+          }
+
+          {
+            echo "# a-organvm hygiene report — ${DAY}"
+            echo ""
+            echo "_Generated ${DAY} $(date -u +%H:%M:%SZ) by plane (i) org-hygiene-report._"
+            echo ""
+            echo "| Repo | Open PRs | Oldest PR (days) | Default branch last push (days) | Open issues |"
+            echo "|------|---------:|-----------------:|--------------------------------:|------------:|"
+          } > "$REPORT"
+
+          # Enumerate org repos (REST, paginated). GITHUB_TOKEN sees public org repos.
+          REPOS="$(gh api --paginate "orgs/${ORG}/repos?per_page=100&type=all" \
+                    --jq '.[] | [.name, .default_branch, .private] | @tsv')"
+
+          TOTAL=0; PRIVATE_SKIPPED=0; TOTAL_OPEN_PRS=0; TOTAL_OPEN_ISSUES=0
+          declare -a SKIPPED_NAMES=()
+
+          while IFS=$'\t' read -r name default_branch is_private; do
+            [ -z "$name" ] && continue
+            TOTAL=$((TOTAL + 1))
+
+            # Oldest open PR + count. issues endpoint counts both; use pulls for PRs.
+            # Handle 403/404 (private / no access) explicitly — count, don't drop.
+            PR_JSON="$(gh api "repos/${ORG}/${name}/pulls?state=open&per_page=100&sort=created&direction=asc" 2>/dev/null || echo "__ERR__")"
+            if [ "$PR_JSON" = "__ERR__" ]; then
+              PRIVATE_SKIPPED=$((PRIVATE_SKIPPED + 1))
+              SKIPPED_NAMES+=("$name")
+              echo "| \`${name}\` | private-skipped | private-skipped | private-skipped | private-skipped |" >> "$REPORT"
+              continue
+            fi
+
+            OPEN_PRS="$(echo "$PR_JSON" | jq 'length')"
+            OLDEST_PR_TS="$(echo "$PR_JSON" | jq -r '.[0].created_at // ""')"
+            OLDEST_PR_AGE="$(age_days "$OLDEST_PR_TS")"
+            [ "$OPEN_PRS" = "0" ] && OLDEST_PR_AGE="-"
+
+            # Default branch last push.
+            BRANCH_JSON="$(gh api "repos/${ORG}/${name}/branches/${default_branch}" 2>/dev/null || echo "__ERR__")"
+            if [ "$BRANCH_JSON" = "__ERR__" ]; then
+              LAST_PUSH_AGE="-"
+            else
+              LAST_PUSH_TS="$(echo "$BRANCH_JSON" | jq -r '.commit.commit.committer.date // ""')"
+              LAST_PUSH_AGE="$(age_days "$LAST_PUSH_TS")"
+            fi
+
+            # Open issues = open "issues" endpoint count minus open PRs (PRs are issues in the API).
+            ISSUES_RAW="$(gh api "repos/${ORG}/${name}/issues?state=open&per_page=100" --jq 'length' 2>/dev/null || echo "0")"
+            OPEN_ISSUES=$(( ISSUES_RAW - OPEN_PRS ))
+            [ "$OPEN_ISSUES" -lt 0 ] && OPEN_ISSUES=0
+
+            TOTAL_OPEN_PRS=$((TOTAL_OPEN_PRS + OPEN_PRS))
+            TOTAL_OPEN_ISSUES=$((TOTAL_OPEN_ISSUES + OPEN_ISSUES))
+
+            echo "| \`${name}\` | ${OPEN_PRS} | ${OLDEST_PR_AGE} | ${LAST_PUSH_AGE} | ${OPEN_ISSUES} |" >> "$REPORT"
+          done <<< "$REPOS"
+
+          {
+            echo ""
+            echo "## Summary"
+            echo ""
+            echo "- Repos enumerated: **${TOTAL}**"
+            echo "- Private/unreadable (counted, not dropped): **${PRIVATE_SKIPPED}**"
+            echo "- Total open PRs (readable repos): **${TOTAL_OPEN_PRS}**"
+            echo "- Total open issues (readable repos): **${TOTAL_OPEN_ISSUES}**"
+            if [ "${#SKIPPED_NAMES[@]}" -gt 0 ]; then
+              echo ""
+              echo "### private-skipped repos"
+              for s in "${SKIPPED_NAMES[@]}"; do echo "- \`${s}\`"; done
+            fi
+          } >> "$REPORT"
+
+          echo "report_path=${REPORT}" >> "$GITHUB_OUTPUT"
+          echo "Wrote ${REPORT} (repos=${TOTAL}, private-skipped=${PRIVATE_SKIPPED})"
+
+      - name: Bookend — end (success)
+        if: success()
+        run: |
+          set -euo pipefail
+          DAY="$(date -u +%Y-%m-%d)"
+          TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mkdir -p bookends
+          printf '%s\t%s\t-\t-\t%s\t%s\n' "$TS" "$JOB_NAME" "end" "success" \
+            >> "bookends/${DAY}.tsv"
+          echo "wrote end(success) bookend to bookends/${DAY}.tsv"
+
+      - name: Bookend — end (failure)
+        if: failure()
+        run: |
+          set -euo pipefail
+          DAY="$(date -u +%Y-%m-%d)"
+          TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mkdir -p bookends
+          printf '%s\t%s\t-\t-\t%s\t%s\n' "$TS" "$JOB_NAME" "end" "failure" \
+            >> "bookends/${DAY}.tsv"
+          echo "wrote end(failure) bookend to bookends/${DAY}.tsv"
+
+      - name: Commit report + bookends [skip ci]
+        if: always()
+        run: |
+          set -euo pipefail
+          DAY="$(date -u +%Y-%m-%d)"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add reports/ bookends/ || true
+          if git diff --cached --quiet; then
+            echo "no changes to commit"
+          else
+            git commit -m "report(hygiene): ${DAY} org hygiene report + bookends [skip ci]"
+            # Rebase-pull guard in case keepalive raced a commit in.
+            git pull --rebase --autostash origin "$(git rev-parse --abbrev-ref HEAD)" || true
+            git push
+          fi
